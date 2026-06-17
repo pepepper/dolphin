@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# Copyright 2026 Dolphin Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 """MCP server that lets an AI assistant (e.g. Claude Code) drive Dolphin.
 
