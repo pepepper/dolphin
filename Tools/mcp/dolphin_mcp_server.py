@@ -434,66 +434,83 @@ def tool_search_memory(args):
     return result
 
 
-# GameCube controller mapping: friendly name -> (group, control).
+# Friendly name -> (group, control) maps for each controller device.
 _GC_BUTTONS = {"a": "A", "b": "B", "x": "X", "y": "Y", "z": "Z", "start": "Start"}
 _GC_DPAD = {"up": "Up", "down": "Down", "left": "Left", "right": "Right"}
 _GC_TRIGGERS = {"l": "L", "r": "R", "l_analog": "L-Analog", "r_analog": "R-Analog"}
 
+_WII_BUTTONS = {"a": "A", "b": "B", "one": "1", "1": "1", "two": "2", "2": "2",
+                "plus": "+", "+": "+", "minus": "-", "-": "-", "home": "Home"}
+_WII_DPAD = {"up": "Up", "down": "Down", "left": "Left", "right": "Right"}
 
-def _stick_overrides(group, axes):
-    overrides = []
+
+def _bool_value(value):
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    return float(value)
+
+
+def _direction_overrides(group, axes):
+    """Drive a directional control group (stick / IR pointer) from x/y in [-1, 1]."""
     x = float(axes.get("x", 0.0))
     y = float(axes.get("y", 0.0))
-    overrides.append({"group": group, "control": "Right", "value": max(x, 0.0)})
-    overrides.append({"group": group, "control": "Left", "value": max(-x, 0.0)})
-    overrides.append({"group": group, "control": "Up", "value": max(y, 0.0)})
-    overrides.append({"group": group, "control": "Down", "value": max(-y, 0.0)})
+    return [
+        {"group": group, "control": "Right", "value": max(x, 0.0)},
+        {"group": group, "control": "Left", "value": max(-x, 0.0)},
+        {"group": group, "control": "Up", "value": max(y, 0.0)},
+        {"group": group, "control": "Down", "value": max(-y, 0.0)},
+    ]
+
+
+def _mapped_buttons(group, mapping, items, kind):
+    overrides = []
+    for name, value in (items or {}).items():
+        control = mapping.get(str(name).lower())
+        if control is None:
+            raise ValueError(f"unknown {kind}: {name}")
+        overrides.append({"group": group, "control": control, "value": _bool_value(value)})
     return overrides
 
 
 def tool_set_input(args):
+    device = args.get("device", "gc")
     pad = args.get("pad", 0)
     overrides = []
 
-    for name, value in (args.get("buttons") or {}).items():
-        control = _GC_BUTTONS.get(name.lower())
-        if control is None:
-            raise ValueError(f"unknown button: {name}")
-        overrides.append({"group": "Buttons", "control": control,
-                          "value": 1.0 if value else 0.0})
+    if device == "wii":
+        overrides += _mapped_buttons("Buttons", _WII_BUTTONS, args.get("buttons"), "button")
+        overrides += _mapped_buttons("D-Pad", _WII_DPAD, args.get("dpad"), "dpad direction")
+        if "pointer" in args:
+            overrides += _direction_overrides("IR", args["pointer"])
+        # Motion (Shake / Tilt / Swing) is available via the raw 'overrides' field.
+    elif device == "gc":
+        overrides += _mapped_buttons("Buttons", _GC_BUTTONS, args.get("buttons"), "button")
+        overrides += _mapped_buttons("D-Pad", _GC_DPAD, args.get("dpad"), "dpad direction")
+        for name, value in (args.get("triggers") or {}).items():
+            control = _GC_TRIGGERS.get(name.lower())
+            if control is None:
+                raise ValueError(f"unknown trigger: {name}")
+            overrides.append({"group": "Triggers", "control": control, "value": _bool_value(value)})
+        if "mainStick" in args:
+            overrides += _direction_overrides("Main Stick", args["mainStick"])
+        if "cStick" in args:
+            overrides += _direction_overrides("C-Stick", args["cStick"])
+    else:
+        raise ValueError("device must be 'gc' or 'wii'")
 
-    for name, value in (args.get("dpad") or {}).items():
-        control = _GC_DPAD.get(name.lower())
-        if control is None:
-            raise ValueError(f"unknown dpad direction: {name}")
-        overrides.append({"group": "D-Pad", "control": control,
-                          "value": 1.0 if value else 0.0})
-
-    for name, value in (args.get("triggers") or {}).items():
-        control = _GC_TRIGGERS.get(name.lower())
-        if control is None:
-            raise ValueError(f"unknown trigger: {name}")
-        if isinstance(value, bool):
-            value = 1.0 if value else 0.0
-        overrides.append({"group": "Triggers", "control": control, "value": float(value)})
-
-    if "mainStick" in args:
-        overrides.extend(_stick_overrides("Main Stick", args["mainStick"]))
-    if "cStick" in args:
-        overrides.extend(_stick_overrides("C-Stick", args["cStick"]))
-
-    if "overrides" in args:  # raw escape hatch
+    if "overrides" in args:  # raw escape hatch: list of {group, control, value}
         overrides.extend(args["overrides"])
 
     if not overrides:
         raise ValueError("no inputs specified")
 
-    return CLIENT.call("input.set", {"pad": pad, "overrides": overrides,
+    return CLIENT.call("input.set", {"device": device, "pad": pad, "overrides": overrides,
                                      "clear": args.get("clear", False)})
 
 
 def tool_clear_input(args):
-    return CLIENT.call("input.clear", {"pad": args.get("pad", 0)})
+    return CLIENT.call("input.clear", {"device": args.get("device", "gc"),
+                                       "pad": args.get("pad", 0)})
 
 
 def tool_raw_rpc(args):
@@ -927,15 +944,18 @@ TOOLS = [
     },
     {
         "name": "dolphin_set_input",
-        "description": "Inject GameCube controller input (overrides real input until cleared). "
-                       "Buttons/dpad are booleans; sticks take x/y in [-1, 1].",
+        "description": "Inject GameCube or Wii Remote input (overrides real input until cleared). "
+                       "Buttons/dpad are booleans; sticks and the Wii pointer take x/y in [-1, 1]. "
+                       "For Wii motion (Shake/Tilt/Swing) use the raw 'overrides' field.",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "device": {"type": "string", "enum": ["gc", "wii"],
+                           "description": "Controller device (default gc)."},
                 "pad": {"type": "integer", "description": "Controller port 0..3 (default 0)."},
                 "buttons": {
                     "type": "object",
-                    "description": "Any of a, b, x, y, z, start -> true/false.",
+                    "description": "GC: a,b,x,y,z,start. Wii: a,b,one,two,plus,minus,home. -> true/false.",
                 },
                 "dpad": {
                     "type": "object",
@@ -943,19 +963,36 @@ TOOLS = [
                 },
                 "triggers": {
                     "type": "object",
-                    "description": "l, r (bool) and/or l_analog, r_analog (0..1).",
+                    "description": "GC only: l, r (bool) and/or l_analog, r_analog (0..1).",
                 },
                 "mainStick": {
                     "type": "object",
                     "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
-                    "description": "Control stick position, x/y in [-1, 1].",
+                    "description": "GC control stick position, x/y in [-1, 1].",
                 },
                 "cStick": {
                     "type": "object",
                     "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
-                    "description": "C-stick position, x/y in [-1, 1].",
+                    "description": "GC C-stick position, x/y in [-1, 1].",
                 },
-                "clear": {"type": "boolean", "description": "Clear existing overrides for this pad first."},
+                "pointer": {
+                    "type": "object",
+                    "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                    "description": "Wii IR pointer position, x/y in [-1, 1].",
+                },
+                "overrides": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "group": {"type": "string"},
+                            "control": {"type": "string"},
+                            "value": {"type": "number"},
+                        },
+                    },
+                    "description": "Raw group/control overrides (e.g. Wii 'Shake'/'Tilt'/'Swing').",
+                },
+                "clear": {"type": "boolean", "description": "Clear existing overrides for this port first."},
             },
         },
         "handler": tool_set_input,
@@ -965,7 +1002,10 @@ TOOLS = [
         "description": "Remove all injected input for a controller port (returns control to the user).",
         "inputSchema": {
             "type": "object",
-            "properties": {"pad": {"type": "integer", "description": "Controller port 0..3 (default 0)."}},
+            "properties": {
+                "device": {"type": "string", "enum": ["gc", "wii"], "description": "Default gc."},
+                "pad": {"type": "integer", "description": "Controller port 0..3 (default 0)."},
+            },
         },
         "handler": tool_clear_input,
     },

@@ -54,7 +54,7 @@ hardcore mode, and the port defaults to `-1` (off).
 | `dolphin_read_u32` / `dolphin_write_u32` | Convenience big-endian 32-bit access. |
 | `dolphin_read_value` / `dolphin_read_string` | Typed value / NUL-terminated string reads. |
 | `dolphin_search_memory` | Fast server-side scan of RAM for a byte pattern or string. |
-| `dolphin_set_input` / `dolphin_clear_input` | Inject / release GameCube controller input. |
+| `dolphin_set_input` / `dolphin_clear_input` | Inject / release GameCube or Wii Remote input. |
 | `dolphin_cheat_search_begin` / `_next` / `_results` / `_end` | Stateful memory search. |
 | `dolphin_cheat_search_generate_ar` | Turn a search result into an Action Replay code. |
 | `dolphin_apply_ar` / `dolphin_apply_gecko` | Apply cheat codes at runtime (merged with existing). |
@@ -102,8 +102,8 @@ Byte payloads are lowercase hex strings.
 | `memory.read` | `{address, size, addressSpace?}` | `{address, size, data}` |
 | `memory.write` | `{address, data, addressSpace?}` | `{written}` |
 | `memory.search` | `{pattern\|string, address?, size?, max?}` | `{count, truncated, addresses}` |
-| `input.set` | `{pad?, overrides:[{group, control, value}], clear?}` | `{set, pad, applied}` |
-| `input.clear` | `{pad?}` | `{cleared, pad}` |
+| `input.set` | `{device?, pad?, overrides:[{group, control, value}], clear?}` | `{set, device, pad, applied}` |
+| `input.clear` | `{device?, pad?}` | `{cleared, device, pad}` |
 | `cheatSearch.begin` | `{dataType?, addressSpace?, aligned?, ranges?}` | `{sessionId}` |
 | `cheatSearch.next` | `{sessionId, compareType?, filterType?, value?, hex?}` | `{resultCount}` |
 | `cheatSearch.results` | `{sessionId, offset?, limit?}` | `{total, results:[{address, value, valueHex}]}` |
@@ -143,13 +143,19 @@ Byte payloads are lowercase hex strings.
   `0x80000000`, or MEM2 from `0x90000000`) directly in the emulator, so it is
   far faster than reading memory out and scanning client-side. Give a `pattern`
   (hex bytes) or a `string`.
-- `input.set` injects GameCube controller input using the same override
-  mechanism as the TAS Input window. Overrides persist until changed or cleared
-  with `input.clear`, so they "hold" across frames. Buttons use `value` 1.0
-  (pressed) / 0.0 (released); analog sticks are driven via their `Up`/`Down`/
-  `Left`/`Right` controls (the `dolphin_set_input` MCP tool maps friendly button
-  names and `x`/`y` stick coordinates to these automatically). Wii Remote input
-  injection is not yet supported.
+- `input.set` injects controller input using the same override mechanism as the
+  TAS Input window. Set `device` to `gc` (GameCube pad, default) or `wii` (Wii
+  Remote). Overrides persist until changed or cleared with `input.clear`, so
+  they "hold" across frames. Buttons use `value` 1.0 (pressed) / 0.0 (released);
+  analog sticks and the Wii IR pointer are driven via their `Up`/`Down`/`Left`/
+  `Right` controls.
+- The `dolphin_set_input` MCP tool maps friendly names to these controls:
+  - GC: `buttons` (a, b, x, y, z, start), `dpad`, `triggers` (l, r, l_analog,
+    r_analog), `mainStick`/`cStick` with `x`/`y` in [-1, 1].
+  - Wii: `buttons` (a, b, one, two, plus, minus, home), `dpad`, and `pointer`
+    with `x`/`y` in [-1, 1] for the IR cursor.
+  - Wii motion (the `Shake`, `Tilt`, and `Swing` groups) and any other control
+    can be driven through the raw `overrides` field (`{group, control, value}`).
 
 ## Typical cheat-search workflow
 

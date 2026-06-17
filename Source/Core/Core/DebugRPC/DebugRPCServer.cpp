@@ -43,6 +43,7 @@
 #include "Core/GeckoCode.h"
 #include "Core/HW/GCPad.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HW/Wiimote.h"
 #include "Core/PowerPC/BreakPoints.h"
 #include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/MMU.h"
@@ -236,11 +237,16 @@ picojson::value Str(std::string v)
 
 // Live controller-input overrides, shared with the override callbacks that the
 // emulation thread invokes while polling controllers. Reset for each boot.
+struct InputDeviceState
+{
+  std::array<std::map<std::pair<std::string, std::string>, ControlState>, 4> ports;
+  std::array<bool, 4> installed{};
+};
 struct InputOverrideState
 {
   std::mutex mutex;
-  std::array<std::map<std::pair<std::string, std::string>, ControlState>, 4> gc_pads;
-  std::array<bool, 4> installed{};
+  InputDeviceState gc;   // GameCube pads
+  InputDeviceState wii;  // Wii Remotes
 };
 InputOverrideState g_input;
 
@@ -250,9 +256,12 @@ public:
   Server(Core::System& system, u16 port) : m_system(system), m_port(port)
   {
     std::lock_guard lock(g_input.mutex);
-    for (auto& pad : g_input.gc_pads)
-      pad.clear();
-    g_input.installed.fill(false);
+    for (InputDeviceState* device : {&g_input.gc, &g_input.wii})
+    {
+      for (auto& port : device->ports)
+        port.clear();
+      device->installed.fill(false);
+    }
   }
 
   bool Start()
@@ -1309,35 +1318,61 @@ private:
     return MakeResult(id, picojson::value(r));
   }
 
-  // -- controller input injection (GameCube pads) ---------------------------
-  void EnsureInputOverrideInstalled(int pad)
+  // -- controller input injection (GameCube pads and Wii Remotes) -----------
+  static InputConfig* GetInputConfigFor(bool is_wii)
   {
-    if (g_input.installed[pad])
+    return is_wii ? Wiimote::GetConfig() : Pad::GetConfig();
+  }
+
+  static InputDeviceState& DeviceState(bool is_wii) { return is_wii ? g_input.wii : g_input.gc; }
+
+  void EnsureInputOverrideInstalled(bool is_wii, int pad)
+  {
+    InputDeviceState& device = DeviceState(is_wii);
+    if (device.installed[pad])
       return;
-    InputConfig* config = Pad::GetConfig();
+    InputConfig* config = GetInputConfigFor(is_wii);
     if (config == nullptr)
       return;
     ControllerEmu::EmulatedController* controller = config->GetController(pad);
     if (controller == nullptr)
       return;
     controller->SetInputOverrideFunction(
-        [pad](std::string_view group_name, std::string_view control_name,
-              ControlState state) -> std::optional<ControlState> {
+        [is_wii, pad](std::string_view group_name, std::string_view control_name,
+                      ControlState state) -> std::optional<ControlState> {
           std::lock_guard lock(g_input.mutex);
-          const auto& overrides = g_input.gc_pads[pad];
+          const auto& overrides = (is_wii ? g_input.wii : g_input.gc).ports[pad];
           const auto it =
               overrides.find({std::string(group_name), std::string(control_name)});
           if (it != overrides.end())
             return it->second;
           return std::nullopt;
         });
-    g_input.installed[pad] = true;
+    device.installed[pad] = true;
+  }
+
+  // Returns nullopt on success, or an error response on bad params.
+  std::optional<bool> ParseInputDevice(const picojson::value& id, const picojson::object& params,
+                                       picojson::value* error_out)
+  {
+    const std::string device = ReadString(params, "device").value_or("gc");
+    if (device == "gc")
+      return false;
+    if (device == "wii")
+      return true;
+    *error_out = MakeError(id, -32602, "'device' must be 'gc' or 'wii'");
+    return std::nullopt;
   }
 
   picojson::value HandleInputSet(const picojson::value& id, const picojson::object& params)
   {
     if (!EmulationActive())
       return MakeError(id, 1, "no emulation active");
+
+    picojson::value device_error;
+    const std::optional<bool> is_wii = ParseInputDevice(id, params, &device_error);
+    if (!is_wii)
+      return device_error;
 
     const int pad = static_cast<int>(ReadUInt(params, "pad").value_or(0));
     if (pad < 0 || pad > 3)
@@ -1352,9 +1387,9 @@ private:
     size_t applied = 0;
     {
       std::lock_guard lock(g_input.mutex);
-      auto& pad_overrides = g_input.gc_pads[pad];
+      auto& port_overrides = DeviceState(*is_wii).ports[pad];
       if (clear)
-        pad_overrides.clear();
+        port_overrides.clear();
       for (const auto& entry : overrides_it->second.get<picojson::array>())
       {
         if (!entry.is<picojson::object>())
@@ -1365,18 +1400,19 @@ private:
         const auto value_it = obj.find("value");
         if (!group || !control || value_it == obj.end() || !value_it->second.is<double>())
           return MakeError(id, -32602, "each override needs 'group', 'control' and numeric 'value'");
-        pad_overrides[{*group, *control}] = value_it->second.get<double>();
+        port_overrides[{*group, *control}] = value_it->second.get<double>();
         ++applied;
       }
     }
 
     {
       const Core::CPUThreadGuard guard(m_system);
-      EnsureInputOverrideInstalled(pad);
+      EnsureInputOverrideInstalled(*is_wii, pad);
     }
 
     picojson::object r;
     r["set"] = picojson::value(true);
+    r["device"] = Str(*is_wii ? "wii" : "gc");
     r["pad"] = Num(pad);
     r["applied"] = Num(static_cast<double>(applied));
     return MakeResult(id, picojson::value(r));
@@ -1384,28 +1420,34 @@ private:
 
   picojson::value HandleInputClear(const picojson::value& id, const picojson::object& params)
   {
+    picojson::value device_error;
+    const std::optional<bool> is_wii = ParseInputDevice(id, params, &device_error);
+    if (!is_wii)
+      return device_error;
+
     const int pad = static_cast<int>(ReadUInt(params, "pad").value_or(0));
     if (pad < 0 || pad > 3)
       return MakeError(id, -32602, "'pad' must be 0..3");
 
     {
       std::lock_guard lock(g_input.mutex);
-      g_input.gc_pads[pad].clear();
+      DeviceState(*is_wii).ports[pad].clear();
     }
 
     if (EmulationActive())
     {
       const Core::CPUThreadGuard guard(m_system);
-      if (InputConfig* config = Pad::GetConfig())
+      if (InputConfig* config = GetInputConfigFor(*is_wii))
       {
         if (ControllerEmu::EmulatedController* controller = config->GetController(pad))
           controller->ClearInputOverrideFunction();
       }
     }
-    g_input.installed[pad] = false;
+    DeviceState(*is_wii).installed[pad] = false;
 
     picojson::object r;
     r["cleared"] = picojson::value(true);
+    r["device"] = Str(*is_wii ? "wii" : "gc");
     r["pad"] = Num(pad);
     return MakeResult(id, picojson::value(r));
   }
