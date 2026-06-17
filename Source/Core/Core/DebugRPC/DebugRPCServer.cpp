@@ -5,12 +5,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -185,6 +187,49 @@ std::optional<Cheats::FilterType> ParseFilterType(const std::string& s)
   return std::nullopt;
 }
 
+// Non-throwing integer parsing (Dolphin builds with -fno-exceptions, so the
+// std::sto* functions cannot be used).
+std::string_view TrimWhitespace(std::string_view sv)
+{
+  while (!sv.empty() && (sv.front() == ' ' || sv.front() == '\t'))
+    sv.remove_prefix(1);
+  while (!sv.empty() && (sv.back() == ' ' || sv.back() == '\t' || sv.back() == '\r'))
+    sv.remove_suffix(1);
+  return sv;
+}
+
+std::optional<u64> ParseUIntString(std::string_view sv)
+{
+  sv = TrimWhitespace(sv);
+  int base = 10;
+  if (sv.size() >= 2 && sv[0] == '0' && (sv[1] == 'x' || sv[1] == 'X'))
+  {
+    base = 16;
+    sv.remove_prefix(2);
+  }
+  if (sv.empty())
+    return std::nullopt;
+  u64 value = 0;
+  const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value, base);
+  if (ec != std::errc() || ptr != sv.data() + sv.size())
+    return std::nullopt;
+  return value;
+}
+
+std::optional<u32> ParseHexU32(std::string_view sv)
+{
+  sv = TrimWhitespace(sv);
+  if (sv.size() >= 2 && sv[0] == '0' && (sv[1] == 'x' || sv[1] == 'X'))
+    sv.remove_prefix(2);
+  if (sv.empty())
+    return std::nullopt;
+  u32 value = 0;
+  const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value, 16);
+  if (ec != std::errc() || ptr != sv.data() + sv.size())
+    return std::nullopt;
+  return value;
+}
+
 // Reads a key as an unsigned integer, accepting either a JSON number or a
 // (possibly "0x"-prefixed) hex/decimal string.
 std::optional<u64> ReadUInt(const picojson::object& obj, const std::string& key)
@@ -195,17 +240,7 @@ std::optional<u64> ReadUInt(const picojson::object& obj, const std::string& key)
   if (it->second.is<double>())
     return static_cast<u64>(it->second.get<double>());
   if (it->second.is<std::string>())
-  {
-    const std::string& s = it->second.get<std::string>();
-    try
-    {
-      return std::stoull(s, nullptr, 0);
-    }
-    catch (...)
-    {
-      return std::nullopt;
-    }
-  }
+    return ParseUIntString(it->second.get<std::string>());
   return std::nullopt;
 }
 
@@ -258,8 +293,8 @@ public:
     std::lock_guard lock(g_input.mutex);
     for (InputDeviceState* device : {&g_input.gc, &g_input.wii})
     {
-      for (auto& port : device->ports)
-        port.clear();
+      for (auto& port_overrides : device->ports)
+        port_overrides.clear();
       device->installed.fill(false);
     }
   }
@@ -422,14 +457,7 @@ private:
     if (const auto it = obj.find("params"); it != obj.end() && it->second.is<picojson::object>())
       params = it->second.get<picojson::object>();
 
-    try
-    {
-      return Serialize(Dispatch(id, method, params));
-    }
-    catch (const std::exception& e)
-    {
-      return Serialize(MakeError(id, -32000, std::string("internal error: ") + e.what()));
-    }
+    return Serialize(Dispatch(id, method, params));
   }
 
   static std::string Serialize(const picojson::value& v) { return v.serialize(false); }
@@ -985,18 +1013,15 @@ private:
       const size_t space = line.find(' ');
       if (space == std::string::npos)
         return MakeError(id, -32602, "invalid gecko line: " + line);
-      try
-      {
-        Gecko::GeckoCode::Code c;
-        c.address = static_cast<u32>(std::stoul(line.substr(0, space), nullptr, 16));
-        c.data = static_cast<u32>(std::stoul(line.substr(space + 1), nullptr, 16));
-        c.original_line = line;
-        code.codes.push_back(c);
-      }
-      catch (...)
-      {
+      const std::optional<u32> address = ParseHexU32(std::string_view(line).substr(0, space));
+      const std::optional<u32> data = ParseHexU32(std::string_view(line).substr(space + 1));
+      if (!address || !data)
         return MakeError(id, -32602, "invalid gecko line: " + line);
-      }
+      Gecko::GeckoCode::Code c;
+      c.address = *address;
+      c.data = *data;
+      c.original_line = line;
+      code.codes.push_back(c);
     }
 
     if (code.codes.empty())
@@ -1369,7 +1394,7 @@ private:
       return;
     controller->SetInputOverrideFunction(
         [is_wii, pad](std::string_view group_name, std::string_view control_name,
-                      ControlState state) -> std::optional<ControlState> {
+                      ControlState /*state*/) -> std::optional<ControlState> {
           std::lock_guard lock(g_input.mutex);
           const auto& overrides = (is_wii ? g_input.wii : g_input.gc).ports[pad];
           const auto it =
