@@ -305,6 +305,123 @@ def tool_apply_gecko(args):
     return CLIENT.call("cheat.applyGecko", params)
 
 
+def tool_save_state(args):
+    params = {}
+    if "file" in args:
+        params["file"] = args["file"]
+    elif "slot" in args:
+        params["slot"] = args["slot"]
+    return CLIENT.call("state.save", params)
+
+
+def tool_load_state(args):
+    params = {}
+    if "file" in args:
+        params["file"] = args["file"]
+    elif "slot" in args:
+        params["slot"] = args["slot"]
+    return CLIENT.call("state.load", params)
+
+
+def tool_screenshot(args):
+    params = {}
+    if "name" in args:
+        params["name"] = args["name"]
+    return CLIENT.call("core.screenshot", params)
+
+
+def tool_frame_advance(args):
+    return CLIENT.call("core.frameAdvance")
+
+
+def tool_symbol_from_address(args):
+    return CLIENT.call("symbol.fromAddress", {"address": args["address"]})
+
+
+def tool_symbol_from_name(args):
+    return CLIENT.call("symbol.fromName", {"name": args["name"]})
+
+
+def tool_add_breakpoint(args):
+    params = {"address": args["address"]}
+    for key in ("break", "log"):
+        if key in args:
+            params[key] = args[key]
+    return CLIENT.call("breakpoint.add", params)
+
+
+def tool_remove_breakpoint(args):
+    return CLIENT.call("breakpoint.remove", {"address": args["address"]})
+
+
+def tool_list_breakpoints(args):
+    return CLIENT.call("breakpoint.list")
+
+
+def tool_clear_breakpoints(args):
+    return CLIENT.call("breakpoint.clear")
+
+
+def tool_add_watchpoint(args):
+    params = {"address": args["address"]}
+    for key in ("end", "read", "write", "break", "log"):
+        if key in args:
+            params[key] = args[key]
+    return CLIENT.call("memcheck.add", params)
+
+
+def tool_remove_watchpoint(args):
+    return CLIENT.call("memcheck.remove", {"address": args["address"]})
+
+
+def tool_list_watchpoints(args):
+    return CLIENT.call("memcheck.list")
+
+
+_STRUCT_FORMATS = {
+    "u8": (1, ">B"), "s8": (1, ">b"),
+    "u16": (2, ">H"), "s16": (2, ">h"),
+    "u32": (4, ">I"), "s32": (4, ">i"),
+    "u64": (8, ">Q"), "s64": (8, ">q"),
+    "f32": (4, ">f"), "f64": (8, ">d"),
+}
+
+
+def tool_read_value(args):
+    import struct
+    value_type = args.get("type", "u32")
+    if value_type not in _STRUCT_FORMATS:
+        raise ValueError(f"unknown type: {value_type}")
+    size, fmt = _STRUCT_FORMATS[value_type]
+    params = {"address": args["address"], "size": size}
+    if "addressSpace" in args:
+        params["addressSpace"] = args["addressSpace"]
+    result = CLIENT.call("memory.read", params)
+    raw = bytes.fromhex(result["data"])
+    value = struct.unpack(fmt, raw)[0]
+    out = {"address": args["address"], "type": value_type, "value": value,
+           "bytes": result["data"]}
+    if value_type.startswith(("u", "s")):
+        out["valueHex"] = f"0x{value & ((1 << (size * 8)) - 1):0{size * 2}x}"
+    return out
+
+
+def tool_read_string(args):
+    address = int(args["address"])
+    max_length = int(args.get("maxLength", 256))
+    params = {"address": address, "size": max_length}
+    if "addressSpace" in args:
+        params["addressSpace"] = args["addressSpace"]
+    raw = bytes.fromhex(CLIENT.call("memory.read", params)["data"])
+    nul = raw.find(b"\x00")
+    if nul != -1:
+        raw = raw[:nul]
+    encoding = args.get("encoding", "utf-8")
+    return {"address": address,
+            "value": raw.decode(encoding, errors="replace"),
+            "length": len(raw)}
+
+
 def tool_raw_rpc(args):
     return CLIENT.call(args["method"], args.get("params", {}))
 
@@ -558,6 +675,165 @@ TOOLS = [
             "required": ["lines"],
         },
         "handler": tool_apply_gecko,
+    },
+    {
+        "name": "dolphin_read_value",
+        "description": "Read a single typed value (big-endian) from emulated memory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "integer"},
+                "type": {"type": "string",
+                         "enum": ["u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64", "f32", "f64"],
+                         "description": "Value type (default u32)."},
+                "addressSpace": _ADDRESS_SPACE_SCHEMA,
+            },
+            "required": ["address"],
+        },
+        "handler": tool_read_value,
+    },
+    {
+        "name": "dolphin_read_string",
+        "description": "Read a NUL-terminated string from emulated memory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "integer"},
+                "maxLength": {"type": "integer", "description": "Max bytes to scan (default 256)."},
+                "encoding": {"type": "string", "description": "Text encoding (default utf-8)."},
+                "addressSpace": _ADDRESS_SPACE_SCHEMA,
+            },
+            "required": ["address"],
+        },
+        "handler": tool_read_string,
+    },
+    {
+        "name": "dolphin_save_state",
+        "description": "Save a save state to a numbered slot or a file path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slot": {"type": "integer", "description": "Save-state slot number."},
+                "file": {"type": "string", "description": "Explicit .sav file path."},
+            },
+        },
+        "handler": tool_save_state,
+    },
+    {
+        "name": "dolphin_load_state",
+        "description": "Load a save state from a numbered slot or a file path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slot": {"type": "integer"},
+                "file": {"type": "string"},
+            },
+        },
+        "handler": tool_load_state,
+    },
+    {
+        "name": "dolphin_screenshot",
+        "description": "Capture a screenshot (requires a rendering backend).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "Optional output file name."}},
+        },
+        "handler": tool_screenshot,
+    },
+    {
+        "name": "dolphin_frame_advance",
+        "description": "Advance emulation by exactly one frame, then pause.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_frame_advance,
+    },
+    {
+        "name": "dolphin_symbol_from_address",
+        "description": "Resolve the symbol (function) containing an address.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"address": {"type": "integer"}},
+            "required": ["address"],
+        },
+        "handler": tool_symbol_from_address,
+    },
+    {
+        "name": "dolphin_symbol_from_name",
+        "description": "Look up a symbol's address/size by name.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+        "handler": tool_symbol_from_name,
+    },
+    {
+        "name": "dolphin_add_breakpoint",
+        "description": "Add a PowerPC code breakpoint (halts only in debugging mode).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "integer"},
+                "break": {"type": "boolean", "description": "Halt on hit (default true)."},
+                "log": {"type": "boolean", "description": "Log on hit (default false)."},
+            },
+            "required": ["address"],
+        },
+        "handler": tool_add_breakpoint,
+    },
+    {
+        "name": "dolphin_remove_breakpoint",
+        "description": "Remove a code breakpoint at an address.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"address": {"type": "integer"}},
+            "required": ["address"],
+        },
+        "handler": tool_remove_breakpoint,
+    },
+    {
+        "name": "dolphin_list_breakpoints",
+        "description": "List all code breakpoints.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_list_breakpoints,
+    },
+    {
+        "name": "dolphin_clear_breakpoints",
+        "description": "Remove all code breakpoints.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_clear_breakpoints,
+    },
+    {
+        "name": "dolphin_add_watchpoint",
+        "description": "Add a memory watchpoint (memcheck) that fires on read/write.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "integer"},
+                "end": {"type": "integer", "description": "End address for a ranged watch."},
+                "read": {"type": "boolean", "description": "Watch reads (default true)."},
+                "write": {"type": "boolean", "description": "Watch writes (default true)."},
+                "break": {"type": "boolean", "description": "Halt on hit (default true)."},
+                "log": {"type": "boolean", "description": "Log on hit (default false)."},
+            },
+            "required": ["address"],
+        },
+        "handler": tool_add_watchpoint,
+    },
+    {
+        "name": "dolphin_remove_watchpoint",
+        "description": "Remove a memory watchpoint at an address.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"address": {"type": "integer"}},
+            "required": ["address"],
+        },
+        "handler": tool_remove_watchpoint,
+    },
+    {
+        "name": "dolphin_list_watchpoints",
+        "description": "List all memory watchpoints.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_list_watchpoints,
     },
     {
         "name": "dolphin_rpc",

@@ -26,20 +26,26 @@
 #include <fmt/format.h>
 #include <picojson.h>
 
+#include "Common/Config/Config.h"
 #include "Common/Logging/Log.h"
 #include "Common/SocketContext.h"
+#include "Common/SymbolDB.h"
 
+#include "Core/ActionReplay.h"
 #include "Core/CheatGeneration.h"
 #include "Core/CheatSearch.h"
+#include "Core/Config/MainSettings.h"
 #include "Core/ConfigManager.h"
 #include "Core/Core.h"
 #include "Core/GeckoCode.h"
 #include "Core/HW/Memmap.h"
+#include "Core/PowerPC/BreakPoints.h"
+#include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/MMU.h"
+#include "Core/PowerPC/PPCSymbolDB.h"
 #include "Core/PowerPC/PowerPC.h"
+#include "Core/State.h"
 #include "Core/System.h"
-
-#include "Core/ActionReplay.h"
 
 namespace DebugRPC
 {
@@ -200,6 +206,14 @@ std::optional<std::string> ReadString(const picojson::object& obj, const std::st
   if (it == obj.end() || !it->second.is<std::string>())
     return std::nullopt;
   return it->second.get<std::string>();
+}
+
+std::optional<bool> ReadBool(const picojson::object& obj, const std::string& key)
+{
+  const auto it = obj.find(key);
+  if (it == obj.end() || !it->second.is<bool>())
+    return std::nullopt;
+  return it->second.get<bool>();
 }
 
 picojson::value Num(double v)
@@ -460,6 +474,32 @@ private:
       return HandleApplyAR(id, params);
     if (method == "cheat.applyGecko")
       return HandleApplyGecko(id, params);
+    if (method == "state.save")
+      return HandleStateSave(id, params);
+    if (method == "state.load")
+      return HandleStateLoad(id, params);
+    if (method == "core.screenshot")
+      return HandleScreenshot(id, params);
+    if (method == "core.frameAdvance")
+      return HandleFrameAdvance(id, params);
+    if (method == "symbol.fromAddress")
+      return HandleSymbolFromAddress(id, params);
+    if (method == "symbol.fromName")
+      return HandleSymbolFromName(id, params);
+    if (method == "breakpoint.add")
+      return HandleBreakpointAdd(id, params);
+    if (method == "breakpoint.remove")
+      return HandleBreakpointRemove(id, params);
+    if (method == "breakpoint.list")
+      return HandleBreakpointList(id);
+    if (method == "breakpoint.clear")
+      return HandleBreakpointClear(id);
+    if (method == "memcheck.add")
+      return HandleMemcheckAdd(id, params);
+    if (method == "memcheck.remove")
+      return HandleMemcheckRemove(id, params);
+    if (method == "memcheck.list")
+      return HandleMemcheckList(id);
 
     return MakeError(id, -32601, "unknown method: " + method);
   }
@@ -837,11 +877,21 @@ private:
     if (code.ops.empty())
       return MakeError(id, -32602, "'ops' is empty");
 
+    EnsureCheatsEnabled();
+    // AddCode appends to the active set, so existing codes are preserved.
     ActionReplay::AddCode(std::move(code));
 
     picojson::object r;
     r["applied"] = picojson::value(true);
     return MakeResult(id, picojson::value(r));
+  }
+
+  // AR/Gecko codes only activate when cheats are enabled in config. Applying a
+  // code is an explicit request to enable it, so turn cheats on if needed.
+  static void EnsureCheatsEnabled()
+  {
+    if (!Config::AreCheatsEnabled())
+      Config::SetCurrent(Config::MAIN_ENABLE_CHEATS, true);
   }
 
   picojson::value HandleApplyGecko(const picojson::value& id, const picojson::object& params)
@@ -883,14 +933,272 @@ private:
     if (code.codes.empty())
       return MakeError(id, -32602, "'lines' is empty");
 
-    // Note: SetActiveCodes replaces the currently active Gecko set with the codes
-    // given here, so any previously active Gecko codes are deactivated.
-    const std::vector<Gecko::GeckoCode> codes = {std::move(code)};
+    EnsureCheatsEnabled();
+
+    // Merge with the codes already active for this game. A code with the same
+    // name is replaced so re-applying updates it rather than duplicating.
+    std::vector<Gecko::GeckoCode> codes = Gecko::GetActiveCodes();
+    std::erase_if(codes, [&](const Gecko::GeckoCode& c) { return c.name == code.name; });
+    codes.push_back(std::move(code));
     Gecko::SetActiveCodes(codes, SConfig::GetInstance().GetGameID(),
                           SConfig::GetInstance().GetRevision());
 
     picojson::object r;
     r["applied"] = picojson::value(true);
+    r["activeCount"] = Num(static_cast<double>(codes.size()));
+    return MakeResult(id, picojson::value(r));
+  }
+
+  // -- save states ----------------------------------------------------------
+  picojson::value HandleStateSave(const picojson::value& id, const picojson::object& params)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+    if (const auto file = ReadString(params, "file"))
+    {
+      State::SaveAs(m_system, *file);
+      picojson::object r;
+      r["saved"] = picojson::value(true);
+      r["file"] = Str(*file);
+      return MakeResult(id, picojson::value(r));
+    }
+    const std::optional<u64> slot = ReadUInt(params, "slot");
+    if (!slot)
+      return MakeError(id, -32602, "provide a 'slot' number or a 'file' path");
+    State::Save(m_system, static_cast<int>(*slot));
+    picojson::object r;
+    r["saved"] = picojson::value(true);
+    r["slot"] = Num(static_cast<double>(*slot));
+    return MakeResult(id, picojson::value(r));
+  }
+
+  picojson::value HandleStateLoad(const picojson::value& id, const picojson::object& params)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+    if (const auto file = ReadString(params, "file"))
+    {
+      State::LoadAs(m_system, *file);
+      picojson::object r;
+      r["loaded"] = picojson::value(true);
+      r["file"] = Str(*file);
+      return MakeResult(id, picojson::value(r));
+    }
+    const std::optional<u64> slot = ReadUInt(params, "slot");
+    if (!slot)
+      return MakeError(id, -32602, "provide a 'slot' number or a 'file' path");
+    State::Load(m_system, static_cast<int>(*slot));
+    picojson::object r;
+    r["loaded"] = picojson::value(true);
+    r["slot"] = Num(static_cast<double>(*slot));
+    return MakeResult(id, picojson::value(r));
+  }
+
+  picojson::value HandleScreenshot(const picojson::value& id, const picojson::object& params)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+    const std::optional<std::string> name = ReadString(params, "name");
+    if (name)
+      Core::SaveScreenShot(*name);
+    else
+      Core::SaveScreenShot();
+    picojson::object r;
+    r["requested"] = picojson::value(true);
+    if (name)
+      r["name"] = Str(*name);
+    return MakeResult(id, picojson::value(r));
+  }
+
+  picojson::value HandleFrameAdvance(const picojson::value& id, const picojson::object& params)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+    // DoFrameStep advances exactly one frame and pauses.
+    Core::DoFrameStep(m_system);
+    picojson::object r;
+    r["advanced"] = picojson::value(true);
+    return MakeResult(id, picojson::value(r));
+  }
+
+  // -- symbols --------------------------------------------------------------
+  picojson::value SymbolToJson(const picojson::value& id, const Common::Symbol* symbol)
+  {
+    picojson::object r;
+    if (symbol == nullptr)
+    {
+      r["found"] = picojson::value(false);
+      return MakeResult(id, picojson::value(r));
+    }
+    r["found"] = picojson::value(true);
+    r["name"] = Str(symbol->name);
+    r["address"] = Num(symbol->address);
+    r["size"] = Num(symbol->size);
+    return MakeResult(id, picojson::value(r));
+  }
+
+  picojson::value HandleSymbolFromAddress(const picojson::value& id, const picojson::object& params)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+    const std::optional<u64> address = ReadUInt(params, "address");
+    if (!address)
+      return MakeError(id, -32602, "missing 'address'");
+    return SymbolToJson(id, m_system.GetPPCSymbolDB().GetSymbolFromAddr(static_cast<u32>(*address)));
+  }
+
+  picojson::value HandleSymbolFromName(const picojson::value& id, const picojson::object& params)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+    const std::optional<std::string> name = ReadString(params, "name");
+    if (!name)
+      return MakeError(id, -32602, "missing 'name'");
+    return SymbolToJson(id, m_system.GetPPCSymbolDB().GetSymbolFromName(*name));
+  }
+
+  // -- code breakpoints -----------------------------------------------------
+  // Note: a breakpoint only halts the CPU if Dolphin is running with debugging
+  // enabled (e.g. MAIN_ENABLE_DEBUGGING / the interpreter). The breakpoint is
+  // always registered regardless.
+  picojson::value HandleBreakpointAdd(const picojson::value& id, const picojson::object& params)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+    const std::optional<u64> address = ReadUInt(params, "address");
+    if (!address)
+      return MakeError(id, -32602, "missing 'address'");
+
+    TBreakPoint bp;
+    bp.address = static_cast<u32>(*address);
+    bp.is_enabled = true;
+    bp.break_on_hit = ReadBool(params, "break").value_or(true);
+    bp.log_on_hit = ReadBool(params, "log").value_or(false);
+
+    const Core::CPUThreadGuard guard(m_system);
+    m_system.GetPowerPC().GetBreakPoints().Add(std::move(bp));
+    m_system.GetJitInterface().ClearCache(guard);
+
+    picojson::object r;
+    r["added"] = picojson::value(true);
+    r["address"] = Num(static_cast<double>(*address));
+    return MakeResult(id, picojson::value(r));
+  }
+
+  picojson::value HandleBreakpointRemove(const picojson::value& id, const picojson::object& params)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+    const std::optional<u64> address = ReadUInt(params, "address");
+    if (!address)
+      return MakeError(id, -32602, "missing 'address'");
+
+    const Core::CPUThreadGuard guard(m_system);
+    const bool removed = m_system.GetPowerPC().GetBreakPoints().Remove(static_cast<u32>(*address));
+    m_system.GetJitInterface().ClearCache(guard);
+
+    picojson::object r;
+    r["removed"] = picojson::value(removed);
+    return MakeResult(id, picojson::value(r));
+  }
+
+  picojson::value HandleBreakpointList(const picojson::value& id)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+    picojson::array list;
+    for (const TBreakPoint& bp : m_system.GetPowerPC().GetBreakPoints().GetBreakPoints())
+    {
+      picojson::object entry;
+      entry["address"] = Num(bp.address);
+      entry["enabled"] = picojson::value(bp.is_enabled);
+      entry["breakOnHit"] = picojson::value(bp.break_on_hit);
+      entry["logOnHit"] = picojson::value(bp.log_on_hit);
+      list.emplace_back(entry);
+    }
+    picojson::object r;
+    r["breakpoints"] = picojson::value(list);
+    return MakeResult(id, picojson::value(r));
+  }
+
+  picojson::value HandleBreakpointClear(const picojson::value& id)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+    const Core::CPUThreadGuard guard(m_system);
+    m_system.GetPowerPC().GetBreakPoints().Clear();
+    m_system.GetJitInterface().ClearCache(guard);
+    return MakeResult(id, picojson::value(picojson::object{}));
+  }
+
+  // -- memory watchpoints (memchecks) ---------------------------------------
+  picojson::value HandleMemcheckAdd(const picojson::value& id, const picojson::object& params)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+    const std::optional<u64> address = ReadUInt(params, "address");
+    if (!address)
+      return MakeError(id, -32602, "missing 'address'");
+    const u32 start = static_cast<u32>(*address);
+    const u32 end = static_cast<u32>(ReadUInt(params, "end").value_or(start));
+
+    TMemCheck mc;
+    mc.start_address = start;
+    mc.end_address = end;
+    mc.is_ranged = end != start;
+    mc.is_enabled = true;
+    mc.is_break_on_read = ReadBool(params, "read").value_or(true);
+    mc.is_break_on_write = ReadBool(params, "write").value_or(true);
+    mc.break_on_hit = ReadBool(params, "break").value_or(true);
+    mc.log_on_hit = ReadBool(params, "log").value_or(false);
+
+    const Core::CPUThreadGuard guard(m_system);
+    const DelayedMemCheckUpdate update = m_system.GetPowerPC().GetMemChecks().Add(std::move(mc));
+    (void)update;  // applies on destruction, while the guard is still held
+
+    picojson::object r;
+    r["added"] = picojson::value(true);
+    return MakeResult(id, picojson::value(r));
+  }
+
+  picojson::value HandleMemcheckRemove(const picojson::value& id, const picojson::object& params)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+    const std::optional<u64> address = ReadUInt(params, "address");
+    if (!address)
+      return MakeError(id, -32602, "missing 'address'");
+
+    const Core::CPUThreadGuard guard(m_system);
+    const DelayedMemCheckUpdate update =
+        m_system.GetPowerPC().GetMemChecks().Remove(static_cast<u32>(*address));
+    (void)update;
+
+    picojson::object r;
+    r["removed"] = picojson::value(true);
+    return MakeResult(id, picojson::value(r));
+  }
+
+  picojson::value HandleMemcheckList(const picojson::value& id)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+    picojson::array list;
+    for (const TMemCheck& mc : m_system.GetPowerPC().GetMemChecks().GetMemChecks())
+    {
+      picojson::object entry;
+      entry["startAddress"] = Num(mc.start_address);
+      entry["endAddress"] = Num(mc.end_address);
+      entry["ranged"] = picojson::value(mc.is_ranged);
+      entry["breakOnRead"] = picojson::value(mc.is_break_on_read);
+      entry["breakOnWrite"] = picojson::value(mc.is_break_on_write);
+      entry["breakOnHit"] = picojson::value(mc.break_on_hit);
+      entry["logOnHit"] = picojson::value(mc.log_on_hit);
+      entry["numHits"] = Num(mc.num_hits);
+      list.emplace_back(entry);
+    }
+    picojson::object r;
+    r["memchecks"] = picojson::value(list);
     return MakeResult(id, picojson::value(r));
   }
 

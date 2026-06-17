@@ -52,9 +52,16 @@ hardcore mode, and the port defaults to `-1` (off).
 | `dolphin_disassemble` | Disassemble N instructions from an address. |
 | `dolphin_read_memory` / `dolphin_write_memory` | Raw byte access (hex strings). |
 | `dolphin_read_u32` / `dolphin_write_u32` | Convenience big-endian 32-bit access. |
+| `dolphin_read_value` / `dolphin_read_string` | Typed value / NUL-terminated string reads. |
 | `dolphin_cheat_search_begin` / `_next` / `_results` / `_end` | Stateful memory search. |
 | `dolphin_cheat_search_generate_ar` | Turn a search result into an Action Replay code. |
-| `dolphin_apply_ar` / `dolphin_apply_gecko` | Apply cheat codes at runtime. |
+| `dolphin_apply_ar` / `dolphin_apply_gecko` | Apply cheat codes at runtime (merged with existing). |
+| `dolphin_save_state` / `dolphin_load_state` | Save states by slot or file. |
+| `dolphin_screenshot` | Capture a screenshot. |
+| `dolphin_frame_advance` | Advance exactly one frame and pause. |
+| `dolphin_symbol_from_address` / `dolphin_symbol_from_name` | Symbol lookup. |
+| `dolphin_add_breakpoint` / `_remove_breakpoint` / `_list_breakpoints` / `_clear_breakpoints` | Code breakpoints. |
+| `dolphin_add_watchpoint` / `_remove_watchpoint` / `_list_watchpoints` | Memory watchpoints. |
 | `dolphin_rpc` | Escape hatch to call any DebugRPC method directly. |
 
 ### Configuration (environment variables)
@@ -98,11 +105,32 @@ Byte payloads are lowercase hex strings.
 | `cheatSearch.generateAR` | `{sessionId, index}` | `{name, ops:[{address, value}], lines:[…]}` |
 | `cheatSearch.end` | `{sessionId}` | `{}` |
 | `cheat.applyAR` | `{name?, ops:[{address, value}]}` | `{applied}` |
-| `cheat.applyGecko` | `{name?, lines:["AAAAAAAA DDDDDDDD", …]}` | `{applied}` |
+| `cheat.applyGecko` | `{name?, lines:["AAAAAAAA DDDDDDDD", …]}` | `{applied, activeCount}` |
+| `state.save` / `state.load` | `{slot}` or `{file}` | `{saved/loaded, …}` |
+| `core.screenshot` | `{name?}` | `{requested}` |
+| `core.frameAdvance` | – | `{advanced}` |
+| `symbol.fromAddress` | `{address}` | `{found, name, address, size}` |
+| `symbol.fromName` | `{name}` | `{found, name, address, size}` |
+| `breakpoint.add` | `{address, break?, log?}` | `{added, address}` |
+| `breakpoint.remove` / `breakpoint.list` / `breakpoint.clear` | `{address}` / – / – | … |
+| `memcheck.add` | `{address, end?, read?, write?, break?, log?}` | `{added}` |
+| `memcheck.remove` / `memcheck.list` | `{address}` / – | … |
 
 `addressSpace` is one of `effective` (default), `physical`, or `virtual`.
 `dataType` is one of `u8 u16 u32 u64 s8 s16 s32 s64 f32 f64`.
 `compareType` is `eq ne lt le gt ge`; `filterType` is `value last none`.
+
+### Cheats and breakpoints
+
+- Applying a cheat enables cheats in the config automatically. `cheat.applyAR`
+  appends to the active Action Replay set; `cheat.applyGecko` merges with the
+  active Gecko set, replacing any existing code with the same name.
+- A code breakpoint or watchpoint is always registered, but it only halts the
+  CPU when Dolphin runs with debugging enabled (e.g. `-d` /
+  `Dolphin.General.EnableDebugging`, or the interpreter CPU core). The JIT cache
+  is cleared on breakpoint changes so newly compiled blocks honor them.
+- Screenshots require an active rendering backend; with the pure `headless`
+  platform there may be nothing to capture.
 
 ## Typical cheat-search workflow
 
