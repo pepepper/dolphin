@@ -3,6 +3,8 @@
 
 #include "Core/DebugRPC/DebugRPCServer.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <map>
@@ -11,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -38,6 +41,7 @@
 #include "Core/ConfigManager.h"
 #include "Core/Core.h"
 #include "Core/GeckoCode.h"
+#include "Core/HW/GCPad.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/BreakPoints.h"
 #include "Core/PowerPC/JitInterface.h"
@@ -46,6 +50,10 @@
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/State.h"
 #include "Core/System.h"
+
+#include "InputCommon/ControllerEmu/ControllerEmu.h"
+#include "InputCommon/ControllerInterface/CoreDevice.h"
+#include "InputCommon/InputConfig.h"
 
 namespace DebugRPC
 {
@@ -226,10 +234,26 @@ picojson::value Str(std::string v)
   return picojson::value(std::move(v));
 }
 
+// Live controller-input overrides, shared with the override callbacks that the
+// emulation thread invokes while polling controllers. Reset for each boot.
+struct InputOverrideState
+{
+  std::mutex mutex;
+  std::array<std::map<std::pair<std::string, std::string>, ControlState>, 4> gc_pads;
+  std::array<bool, 4> installed{};
+};
+InputOverrideState g_input;
+
 class Server
 {
 public:
-  Server(Core::System& system, u16 port) : m_system(system), m_port(port) {}
+  Server(Core::System& system, u16 port) : m_system(system), m_port(port)
+  {
+    std::lock_guard lock(g_input.mutex);
+    for (auto& pad : g_input.gc_pads)
+      pad.clear();
+    g_input.installed.fill(false);
+  }
 
   bool Start()
   {
@@ -460,6 +484,12 @@ private:
       return HandleMemoryRead(id, params);
     if (method == "memory.write")
       return HandleMemoryWrite(id, params);
+    if (method == "memory.search")
+      return HandleMemorySearch(id, params);
+    if (method == "input.set")
+      return HandleInputSet(id, params);
+    if (method == "input.clear")
+      return HandleInputClear(id, params);
     if (method == "cheatSearch.begin")
       return HandleCheatSearchBegin(id, params);
     if (method == "cheatSearch.next")
@@ -1199,6 +1229,184 @@ private:
     }
     picojson::object r;
     r["memchecks"] = picojson::value(list);
+    return MakeResult(id, picojson::value(r));
+  }
+
+  // -- fast server-side memory scan -----------------------------------------
+  picojson::value HandleMemorySearch(const picojson::value& id, const picojson::object& params)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+
+    std::vector<u8> needle;
+    if (const auto pattern = ReadString(params, "pattern"))
+    {
+      const std::optional<std::vector<u8>> bytes = HexToBytes(*pattern);
+      if (!bytes)
+        return MakeError(id, -32602, "'pattern' is not a valid hex string");
+      needle = *bytes;
+    }
+    else if (const auto text = ReadString(params, "string"))
+    {
+      needle.assign(text->begin(), text->end());
+    }
+    else
+    {
+      return MakeError(id, -32602, "provide 'pattern' (hex bytes) or 'string'");
+    }
+    if (needle.empty())
+      return MakeError(id, -32602, "search pattern is empty");
+
+    auto& memory = m_system.GetMemory();
+    const u32 ram_size = memory.GetRamSizeReal();
+    const u32 exram_size = memory.GetExRamSizeReal();
+
+    const u32 start = static_cast<u32>(ReadUInt(params, "address").value_or(0x80000000));
+    // The scan operates within a single contiguous RAM region (MEM1 or MEM2).
+    u32 region_end = 0;
+    if (start >= 0x80000000 && start < 0x80000000 + ram_size)
+      region_end = 0x80000000 + ram_size;
+    else if (exram_size != 0 && start >= 0x90000000 && start < 0x90000000 + exram_size)
+      region_end = 0x90000000 + exram_size;
+    else
+      return MakeError(id, -32602, "'address' is not within MEM1/MEM2");
+
+    u64 length = ReadUInt(params, "size").value_or(0);
+    if (length == 0 || start + length > region_end)
+      length = region_end - start;
+
+    const size_t max_results = static_cast<size_t>(ReadUInt(params, "max").value_or(1000));
+
+    const Core::CPUThreadGuard guard(m_system);
+    const u8* base = memory.GetPointerForRange(start, length);
+    if (base == nullptr)
+      return MakeError(id, 2, "memory range not accessible");
+
+    picojson::array addresses;
+    size_t count = 0;
+    bool truncated = false;
+    const u8* const end = base + length;
+    const u8* cursor = base;
+    while (cursor < end)
+    {
+      const u8* found = std::search(cursor, end, needle.begin(), needle.end());
+      if (found == end)
+        break;
+      if (count >= max_results)
+      {
+        truncated = true;
+        break;
+      }
+      addresses.emplace_back(Num(start + static_cast<u32>(found - base)));
+      ++count;
+      cursor = found + 1;
+    }
+
+    picojson::object r;
+    r["count"] = Num(static_cast<double>(count));
+    r["truncated"] = picojson::value(truncated);
+    r["addresses"] = picojson::value(addresses);
+    return MakeResult(id, picojson::value(r));
+  }
+
+  // -- controller input injection (GameCube pads) ---------------------------
+  void EnsureInputOverrideInstalled(int pad)
+  {
+    if (g_input.installed[pad])
+      return;
+    InputConfig* config = Pad::GetConfig();
+    if (config == nullptr)
+      return;
+    ControllerEmu::EmulatedController* controller = config->GetController(pad);
+    if (controller == nullptr)
+      return;
+    controller->SetInputOverrideFunction(
+        [pad](std::string_view group_name, std::string_view control_name,
+              ControlState state) -> std::optional<ControlState> {
+          std::lock_guard lock(g_input.mutex);
+          const auto& overrides = g_input.gc_pads[pad];
+          const auto it =
+              overrides.find({std::string(group_name), std::string(control_name)});
+          if (it != overrides.end())
+            return it->second;
+          return std::nullopt;
+        });
+    g_input.installed[pad] = true;
+  }
+
+  picojson::value HandleInputSet(const picojson::value& id, const picojson::object& params)
+  {
+    if (!EmulationActive())
+      return MakeError(id, 1, "no emulation active");
+
+    const int pad = static_cast<int>(ReadUInt(params, "pad").value_or(0));
+    if (pad < 0 || pad > 3)
+      return MakeError(id, -32602, "'pad' must be 0..3");
+
+    const auto overrides_it = params.find("overrides");
+    if (overrides_it == params.end() || !overrides_it->second.is<picojson::array>())
+      return MakeError(id, -32602, "missing 'overrides' array of {group,control,value}");
+
+    const bool clear = ReadBool(params, "clear").value_or(false);
+
+    size_t applied = 0;
+    {
+      std::lock_guard lock(g_input.mutex);
+      auto& pad_overrides = g_input.gc_pads[pad];
+      if (clear)
+        pad_overrides.clear();
+      for (const auto& entry : overrides_it->second.get<picojson::array>())
+      {
+        if (!entry.is<picojson::object>())
+          continue;
+        const auto& obj = entry.get<picojson::object>();
+        const std::optional<std::string> group = ReadString(obj, "group");
+        const std::optional<std::string> control = ReadString(obj, "control");
+        const auto value_it = obj.find("value");
+        if (!group || !control || value_it == obj.end() || !value_it->second.is<double>())
+          return MakeError(id, -32602, "each override needs 'group', 'control' and numeric 'value'");
+        pad_overrides[{*group, *control}] = value_it->second.get<double>();
+        ++applied;
+      }
+    }
+
+    {
+      const Core::CPUThreadGuard guard(m_system);
+      EnsureInputOverrideInstalled(pad);
+    }
+
+    picojson::object r;
+    r["set"] = picojson::value(true);
+    r["pad"] = Num(pad);
+    r["applied"] = Num(static_cast<double>(applied));
+    return MakeResult(id, picojson::value(r));
+  }
+
+  picojson::value HandleInputClear(const picojson::value& id, const picojson::object& params)
+  {
+    const int pad = static_cast<int>(ReadUInt(params, "pad").value_or(0));
+    if (pad < 0 || pad > 3)
+      return MakeError(id, -32602, "'pad' must be 0..3");
+
+    {
+      std::lock_guard lock(g_input.mutex);
+      g_input.gc_pads[pad].clear();
+    }
+
+    if (EmulationActive())
+    {
+      const Core::CPUThreadGuard guard(m_system);
+      if (InputConfig* config = Pad::GetConfig())
+      {
+        if (ControllerEmu::EmulatedController* controller = config->GetController(pad))
+          controller->ClearInputOverrideFunction();
+      }
+    }
+    g_input.installed[pad] = false;
+
+    picojson::object r;
+    r["cleared"] = picojson::value(true);
+    r["pad"] = Num(pad);
     return MakeResult(id, picojson::value(r));
   }
 

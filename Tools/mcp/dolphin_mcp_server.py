@@ -422,6 +422,80 @@ def tool_read_string(args):
             "length": len(raw)}
 
 
+def tool_search_memory(args):
+    params = {}
+    for key in ("pattern", "string", "address", "size", "max", "addressSpace"):
+        if key in args:
+            params[key] = args[key]
+    if "pattern" not in params and "string" not in params:
+        raise ValueError("provide 'pattern' (hex) or 'string'")
+    result = CLIENT.call("memory.search", params)
+    result["addressesHex"] = [f"0x{a:08x}" for a in result.get("addresses", [])]
+    return result
+
+
+# GameCube controller mapping: friendly name -> (group, control).
+_GC_BUTTONS = {"a": "A", "b": "B", "x": "X", "y": "Y", "z": "Z", "start": "Start"}
+_GC_DPAD = {"up": "Up", "down": "Down", "left": "Left", "right": "Right"}
+_GC_TRIGGERS = {"l": "L", "r": "R", "l_analog": "L-Analog", "r_analog": "R-Analog"}
+
+
+def _stick_overrides(group, axes):
+    overrides = []
+    x = float(axes.get("x", 0.0))
+    y = float(axes.get("y", 0.0))
+    overrides.append({"group": group, "control": "Right", "value": max(x, 0.0)})
+    overrides.append({"group": group, "control": "Left", "value": max(-x, 0.0)})
+    overrides.append({"group": group, "control": "Up", "value": max(y, 0.0)})
+    overrides.append({"group": group, "control": "Down", "value": max(-y, 0.0)})
+    return overrides
+
+
+def tool_set_input(args):
+    pad = args.get("pad", 0)
+    overrides = []
+
+    for name, value in (args.get("buttons") or {}).items():
+        control = _GC_BUTTONS.get(name.lower())
+        if control is None:
+            raise ValueError(f"unknown button: {name}")
+        overrides.append({"group": "Buttons", "control": control,
+                          "value": 1.0 if value else 0.0})
+
+    for name, value in (args.get("dpad") or {}).items():
+        control = _GC_DPAD.get(name.lower())
+        if control is None:
+            raise ValueError(f"unknown dpad direction: {name}")
+        overrides.append({"group": "D-Pad", "control": control,
+                          "value": 1.0 if value else 0.0})
+
+    for name, value in (args.get("triggers") or {}).items():
+        control = _GC_TRIGGERS.get(name.lower())
+        if control is None:
+            raise ValueError(f"unknown trigger: {name}")
+        if isinstance(value, bool):
+            value = 1.0 if value else 0.0
+        overrides.append({"group": "Triggers", "control": control, "value": float(value)})
+
+    if "mainStick" in args:
+        overrides.extend(_stick_overrides("Main Stick", args["mainStick"]))
+    if "cStick" in args:
+        overrides.extend(_stick_overrides("C-Stick", args["cStick"]))
+
+    if "overrides" in args:  # raw escape hatch
+        overrides.extend(args["overrides"])
+
+    if not overrides:
+        raise ValueError("no inputs specified")
+
+    return CLIENT.call("input.set", {"pad": pad, "overrides": overrides,
+                                     "clear": args.get("clear", False)})
+
+
+def tool_clear_input(args):
+    return CLIENT.call("input.clear", {"pad": args.get("pad", 0)})
+
+
 def tool_raw_rpc(args):
     return CLIENT.call(args["method"], args.get("params", {}))
 
@@ -834,6 +908,66 @@ TOOLS = [
         "description": "List all memory watchpoints.",
         "inputSchema": {"type": "object", "properties": {}},
         "handler": tool_list_watchpoints,
+    },
+    {
+        "name": "dolphin_search_memory",
+        "description": "Fast server-side scan of emulated RAM for a byte pattern or string; "
+                       "returns matching addresses.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Hex byte pattern, e.g. '3f800000'."},
+                "string": {"type": "string", "description": "ASCII string to find (alternative to pattern)."},
+                "address": {"type": "integer", "description": "Start address (default 0x80000000)."},
+                "size": {"type": "integer", "description": "Bytes to scan (default: rest of the region)."},
+                "max": {"type": "integer", "description": "Max results to return (default 1000)."},
+            },
+        },
+        "handler": tool_search_memory,
+    },
+    {
+        "name": "dolphin_set_input",
+        "description": "Inject GameCube controller input (overrides real input until cleared). "
+                       "Buttons/dpad are booleans; sticks take x/y in [-1, 1].",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pad": {"type": "integer", "description": "Controller port 0..3 (default 0)."},
+                "buttons": {
+                    "type": "object",
+                    "description": "Any of a, b, x, y, z, start -> true/false.",
+                },
+                "dpad": {
+                    "type": "object",
+                    "description": "Any of up, down, left, right -> true/false.",
+                },
+                "triggers": {
+                    "type": "object",
+                    "description": "l, r (bool) and/or l_analog, r_analog (0..1).",
+                },
+                "mainStick": {
+                    "type": "object",
+                    "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                    "description": "Control stick position, x/y in [-1, 1].",
+                },
+                "cStick": {
+                    "type": "object",
+                    "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                    "description": "C-stick position, x/y in [-1, 1].",
+                },
+                "clear": {"type": "boolean", "description": "Clear existing overrides for this pad first."},
+            },
+        },
+        "handler": tool_set_input,
+    },
+    {
+        "name": "dolphin_clear_input",
+        "description": "Remove all injected input for a controller port (returns control to the user).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"pad": {"type": "integer", "description": "Controller port 0..3 (default 0)."}},
+        },
+        "handler": tool_clear_input,
     },
     {
         "name": "dolphin_rpc",

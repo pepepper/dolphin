@@ -53,6 +53,8 @@ hardcore mode, and the port defaults to `-1` (off).
 | `dolphin_read_memory` / `dolphin_write_memory` | Raw byte access (hex strings). |
 | `dolphin_read_u32` / `dolphin_write_u32` | Convenience big-endian 32-bit access. |
 | `dolphin_read_value` / `dolphin_read_string` | Typed value / NUL-terminated string reads. |
+| `dolphin_search_memory` | Fast server-side scan of RAM for a byte pattern or string. |
+| `dolphin_set_input` / `dolphin_clear_input` | Inject / release GameCube controller input. |
 | `dolphin_cheat_search_begin` / `_next` / `_results` / `_end` | Stateful memory search. |
 | `dolphin_cheat_search_generate_ar` | Turn a search result into an Action Replay code. |
 | `dolphin_apply_ar` / `dolphin_apply_gecko` | Apply cheat codes at runtime (merged with existing). |
@@ -99,6 +101,9 @@ Byte payloads are lowercase hex strings.
 | `cpu.disassemble` | `{address, count?}` | `{instructions:[{address, raw, text}]}` |
 | `memory.read` | `{address, size, addressSpace?}` | `{address, size, data}` |
 | `memory.write` | `{address, data, addressSpace?}` | `{written}` |
+| `memory.search` | `{pattern\|string, address?, size?, max?}` | `{count, truncated, addresses}` |
+| `input.set` | `{pad?, overrides:[{group, control, value}], clear?}` | `{set, pad, applied}` |
+| `input.clear` | `{pad?}` | `{cleared, pad}` |
 | `cheatSearch.begin` | `{dataType?, addressSpace?, aligned?, ranges?}` | `{sessionId}` |
 | `cheatSearch.next` | `{sessionId, compareType?, filterType?, value?, hex?}` | `{resultCount}` |
 | `cheatSearch.results` | `{sessionId, offset?, limit?}` | `{total, results:[{address, value, valueHex}]}` |
@@ -131,6 +136,20 @@ Byte payloads are lowercase hex strings.
   is cleared on breakpoint changes so newly compiled blocks honor them.
 - Screenshots require an active rendering backend; with the pure `headless`
   platform there may be nothing to capture.
+
+### Memory search and input injection
+
+- `memory.search` scans a single contiguous RAM region (MEM1 from
+  `0x80000000`, or MEM2 from `0x90000000`) directly in the emulator, so it is
+  far faster than reading memory out and scanning client-side. Give a `pattern`
+  (hex bytes) or a `string`.
+- `input.set` injects GameCube controller input using the same override
+  mechanism as the TAS Input window. Overrides persist until changed or cleared
+  with `input.clear`, so they "hold" across frames. Buttons use `value` 1.0
+  (pressed) / 0.0 (released); analog sticks are driven via their `Up`/`Down`/
+  `Left`/`Right` controls (the `dolphin_set_input` MCP tool maps friendly button
+  names and `x`/`y` stick coordinates to these automatically). Wii Remote input
+  injection is not yet supported.
 
 ## Typical cheat-search workflow
 
