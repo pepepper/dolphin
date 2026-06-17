@@ -15,9 +15,11 @@
 #include <Windows.h>
 #endif
 
+#include "Common/Config/Config.h"
 #include "Common/ScopeGuard.h"
 #include "Core/Boot/Boot.h"
 #include "Core/BootManager.h"
+#include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
 #include "Core/DolphinAnalytics.h"
 #include "Core/Host.h"
@@ -210,6 +212,12 @@ int main(const int argc, char* argv[])
 #endif
       });
 
+  parser->add_option("--debug-rpc-port")
+      .dest("debug_rpc_port")
+      .type("int")
+      .action("store")
+      .help("Start the DebugRPC JSON-RPC server on the given TCP port (loopback only)");
+
   optparse::Values& options = CommandLineParse::ParseArguments(parser.get(), argc, argv);
   std::vector<std::string> args = parser->args();
 
@@ -300,6 +308,12 @@ int main(const int argc, char* argv[])
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
 #endif
+
+  if (options.is_set("debug_rpc_port"))
+  {
+    const int debug_rpc_port = static_cast<int>(options.get("debug_rpc_port"));
+    Config::SetCurrent(Config::MAIN_DEBUG_RPC_PORT, debug_rpc_port);
+  }
 
   DolphinAnalytics::Instance().ReportDolphinStart("nogui");
 

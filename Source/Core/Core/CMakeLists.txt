@@ -78,6 +78,8 @@ add_library(core
   Debugger/PPCDebugInterface.h
   Debugger/RSO.cpp
   Debugger/RSO.h
+  DebugRPC/DebugRPCServer.cpp
+  DebugRPC/DebugRPCServer.h
   DolphinAnalytics.cpp
   DolphinAnalytics.h
   DSP/DSPAccelerator.cpp

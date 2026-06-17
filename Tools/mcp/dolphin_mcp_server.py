@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+# Copyright 2026 Dolphin Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""MCP server that lets an AI assistant (e.g. Claude Code) drive Dolphin.
+
+It speaks the Model Context Protocol over stdio and proxies tool calls to a
+running Dolphin instance through the DebugRPC JSON-RPC TCP server (see
+``docs/DebugRPC.md``). It can also launch and quit the headless Dolphin
+frontend itself, so "start a game" is just another tool call.
+
+Only the Python standard library is used, so it runs anywhere Python 3.9+ is
+available without installing anything.
+
+Configuration via environment variables:
+  DOLPHIN_NOGUI      Path to the dolphin-emu-nogui executable
+                     (default: "dolphin-emu-nogui" on PATH).
+  DOLPHIN_RPC_HOST   DebugRPC host to connect to (default: 127.0.0.1).
+  DOLPHIN_RPC_PORT   Default DebugRPC port (default: 6090).
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+PROTOCOL_VERSION = "2025-06-18"
+SERVER_NAME = "dolphin-debug-rpc"
+SERVER_VERSION = "1.0.0"
+
+DEFAULT_HOST = os.environ.get("DOLPHIN_RPC_HOST", "127.0.0.1")
+DEFAULT_PORT = int(os.environ.get("DOLPHIN_RPC_PORT", "6090"))
+DOLPHIN_NOGUI = os.environ.get("DOLPHIN_NOGUI", "dolphin-emu-nogui")
+
+
+def log(message):
+    """Diagnostics go to stderr; stdout is reserved for the MCP protocol."""
+    print(f"[dolphin-mcp] {message}", file=sys.stderr, flush=True)
+
+
+class DebugRPCClient:
+    """A thin client for Dolphin's line-delimited JSON-RPC DebugRPC server."""
+
+    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT):
+        self.host = host
+        self.port = port
+        self._sock = None
+        self._buffer = b""
+        self._next_id = 1
+        self._process = None
+
+    # -- connection management ------------------------------------------------
+    def connect(self, timeout=2.0):
+        self.close()
+        sock = socket.create_connection((self.host, self.port), timeout=timeout)
+        sock.settimeout(10.0)
+        self._sock = sock
+        self._buffer = b""
+
+    def is_connected(self):
+        return self._sock is not None
+
+    def ensure_connected(self):
+        if self._sock is None:
+            self.connect()
+
+    def close(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        self._sock = None
+        self._buffer = b""
+
+    def wait_for_server(self, timeout=30.0):
+        """Poll the TCP port until the DebugRPC server accepts a connection."""
+        deadline = time.time() + timeout
+        last_error = None
+        while time.time() < deadline:
+            if self._process is not None and self._process.poll() is not None:
+                raise RuntimeError(
+                    f"Dolphin exited early with code {self._process.returncode}"
+                )
+            try:
+                self.connect(timeout=1.0)
+                return True
+            except OSError as exc:  # not listening yet
+                last_error = exc
+                time.sleep(0.25)
+        raise RuntimeError(f"Timed out waiting for DebugRPC on "
+                           f"{self.host}:{self.port}: {last_error}")
+
+    # -- request/response -----------------------------------------------------
+    def call(self, method, params=None):
+        self.ensure_connected()
+        request_id = self._next_id
+        self._next_id += 1
+        payload = {"id": request_id, "method": method, "params": params or {}}
+        line = (json.dumps(payload) + "\n").encode("utf-8")
+        try:
+            self._sock.sendall(line)
+            response = self._read_line()
+        except OSError as exc:
+            self.close()
+            raise RuntimeError(f"DebugRPC connection error: {exc}") from exc
+
+        message = json.loads(response)
+        if "error" in message and message["error"] is not None:
+            err = message["error"]
+            raise RuntimeError(f"DebugRPC error {err.get('code')}: {err.get('message')}")
+        return message.get("result", {})
+
+    def _read_line(self):
+        while b"\n" not in self._buffer:
+            chunk = self._sock.recv(65536)
+            if not chunk:
+                raise OSError("connection closed by Dolphin")
+            self._buffer += chunk
+        line, _, rest = self._buffer.partition(b"\n")
+        self._buffer = rest
+        return line.decode("utf-8")
+
+    # -- process lifecycle ----------------------------------------------------
+    def launch(self, rom_path, port=None, dolphin_path=None, platform="headless",
+               extra_args=None):
+        if port is not None:
+            self.port = int(port)
+        executable = dolphin_path or DOLPHIN_NOGUI
+        args = [executable, "--exec", rom_path,
+                "--debug-rpc-port", str(self.port),
+                "-p", platform]
+        if extra_args:
+            args.extend(extra_args)
+        log(f"launching: {' '.join(args)}")
+        self._process = subprocess.Popen(args)
+        self.wait_for_server()
+        return self.port
+
+    def quit(self):
+        try:
+            if self.is_connected():
+                self.call("core.stop")
+        except Exception:
+            pass
+        self.close()
+        if self._process is not None:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=10)
+            except Exception:
+                try:
+                    self._process.kill()
+                except Exception:
+                    pass
+            self._process = None
+
+
+CLIENT = DebugRPCClient()
+
+
+# --- Tool definitions --------------------------------------------------------
+# Each tool maps to a Python handler. Many handlers are thin forwarders to a
+# DebugRPC method with the same parameters.
+
+def _u32_to_hex_le(value):
+    return f"{value & 0xffffffff:08x}"
+
+
+def tool_launch_game(args):
+    rom = args["romPath"]
+    port = args.get("port")
+    dolphin_path = args.get("dolphinPath")
+    platform = args.get("platform", "headless")
+    used_port = CLIENT.launch(rom, port=port, dolphin_path=dolphin_path,
+                              platform=platform)
+    status = CLIENT.call("core.status")
+    return {"launched": True, "port": used_port, "status": status}
+
+
+def tool_quit(args):
+    CLIENT.quit()
+    return {"stopped": True}
+
+
+def tool_connect(args):
+    host = args.get("host", CLIENT.host)
+    port = args.get("port", CLIENT.port)
+    CLIENT.host = host
+    CLIENT.port = int(port)
+    CLIENT.connect()
+    return {"connected": True, "host": host, "port": CLIENT.port}
+
+
+def tool_status(args):
+    return CLIENT.call("core.status")
+
+
+def tool_set_state(args):
+    state = args["state"]
+    if state == "run":
+        return CLIENT.call("core.run")
+    if state == "pause":
+        return CLIENT.call("core.pause")
+    if state == "stop":
+        return CLIENT.call("core.stop")
+    raise ValueError("state must be one of: run, pause, stop")
+
+
+def tool_step(args):
+    return CLIENT.call("cpu.step")
+
+
+def tool_registers(args):
+    result = CLIENT.call("cpu.registers")
+    # Add hex views for readability.
+    if "pc" in result:
+        result["pcHex"] = f"0x{int(result['pc']) & 0xffffffff:08x}"
+    if "gpr" in result:
+        result["gprHex"] = [f"0x{int(v) & 0xffffffff:08x}" for v in result["gpr"]]
+    return result
+
+
+def tool_disassemble(args):
+    params = {"address": args["address"]}
+    if "count" in args:
+        params["count"] = args["count"]
+    return CLIENT.call("cpu.disassemble", params)
+
+
+def tool_read_memory(args):
+    params = {"address": args["address"], "size": args["size"]}
+    if "addressSpace" in args:
+        params["addressSpace"] = args["addressSpace"]
+    return CLIENT.call("memory.read", params)
+
+
+def tool_write_memory(args):
+    params = {"address": args["address"], "data": args["data"]}
+    if "addressSpace" in args:
+        params["addressSpace"] = args["addressSpace"]
+    return CLIENT.call("memory.write", params)
+
+
+def tool_read_u32(args):
+    result = CLIENT.call("memory.read", {"address": args["address"], "size": 4})
+    data = bytes.fromhex(result["data"])
+    value = int.from_bytes(data, "big")
+    return {"address": args["address"], "value": value,
+            "valueHex": f"0x{value:08x}", "bytes": result["data"]}
+
+
+def tool_write_u32(args):
+    value = int(args["value"])
+    data = value.to_bytes(4, "big").hex()
+    params = {"address": args["address"], "data": data}
+    return CLIENT.call("memory.write", params)
+
+
+def tool_cheat_search_begin(args):
+    params = {"dataType": args.get("dataType", "u32")}
+    for key in ("addressSpace", "aligned", "ranges"):
+        if key in args:
+            params[key] = args[key]
+    return CLIENT.call("cheatSearch.begin", params)
+
+
+def tool_cheat_search_next(args):
+    params = {"sessionId": args["sessionId"]}
+    for key in ("compareType", "filterType", "value", "hex"):
+        if key in args:
+            params[key] = args[key]
+    return CLIENT.call("cheatSearch.next", params)
+
+
+def tool_cheat_search_results(args):
+    params = {"sessionId": args["sessionId"]}
+    for key in ("offset", "limit"):
+        if key in args:
+            params[key] = args[key]
+    return CLIENT.call("cheatSearch.results", params)
+
+
+def tool_cheat_search_generate_ar(args):
+    return CLIENT.call("cheatSearch.generateAR",
+                       {"sessionId": args["sessionId"], "index": args["index"]})
+
+
+def tool_cheat_search_end(args):
+    return CLIENT.call("cheatSearch.end", {"sessionId": args["sessionId"]})
+
+
+def tool_apply_ar(args):
+    params = {"ops": args["ops"]}
+    if "name" in args:
+        params["name"] = args["name"]
+    return CLIENT.call("cheat.applyAR", params)
+
+
+def tool_apply_gecko(args):
+    params = {"lines": args["lines"]}
+    if "name" in args:
+        params["name"] = args["name"]
+    return CLIENT.call("cheat.applyGecko", params)
+
+
+def tool_raw_rpc(args):
+    return CLIENT.call(args["method"], args.get("params", {}))
+
+
+_ADDRESS_SPACE_SCHEMA = {
+    "type": "string",
+    "enum": ["effective", "physical", "virtual"],
+    "description": "Address space to use (default: effective).",
+}
+
+TOOLS = [
+    {
+        "name": "dolphin_launch_game",
+        "description": "Launch a GameCube/Wii game in headless Dolphin with the "
+                       "DebugRPC server enabled, then connect to it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "romPath": {"type": "string", "description": "Path to the ISO/WBFS/ELF/DOL to boot."},
+                "port": {"type": "integer", "description": "DebugRPC TCP port (default 6090)."},
+                "dolphinPath": {"type": "string", "description": "Path to dolphin-emu-nogui."},
+                "platform": {"type": "string", "description": "Window platform (default headless)."},
+            },
+            "required": ["romPath"],
+        },
+        "handler": tool_launch_game,
+    },
+    {
+        "name": "dolphin_quit",
+        "description": "Stop the running game and terminate the Dolphin process started by this server.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_quit,
+    },
+    {
+        "name": "dolphin_connect",
+        "description": "Connect to an already-running Dolphin DebugRPC server (host/port).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string"},
+                "port": {"type": "integer"},
+            },
+        },
+        "handler": tool_connect,
+    },
+    {
+        "name": "dolphin_status",
+        "description": "Get core run state and the currently loaded game's ID/title/revision.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_status,
+    },
+    {
+        "name": "dolphin_set_state",
+        "description": "Control emulation: run, pause, or stop.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"state": {"type": "string", "enum": ["run", "pause", "stop"]}},
+            "required": ["state"],
+        },
+        "handler": tool_set_state,
+    },
+    {
+        "name": "dolphin_step",
+        "description": "Execute a single CPU instruction (steps the PowerPC core).",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_step,
+    },
+    {
+        "name": "dolphin_registers",
+        "description": "Read the PowerPC registers (pc, lr, ctr, msr, gpr[0..31]).",
+        "inputSchema": {"type": "object", "properties": {}},
+        "handler": tool_registers,
+    },
+    {
+        "name": "dolphin_disassemble",
+        "description": "Disassemble PowerPC instructions starting at an address.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "integer", "description": "Start address, e.g. 0x80003100."},
+                "count": {"type": "integer", "description": "Number of instructions (default 16)."},
+            },
+            "required": ["address"],
+        },
+        "handler": tool_disassemble,
+    },
+    {
+        "name": "dolphin_read_memory",
+        "description": "Read raw bytes of emulated memory; returns a hex string.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "integer"},
+                "size": {"type": "integer", "description": "Number of bytes (1..0x100000)."},
+                "addressSpace": _ADDRESS_SPACE_SCHEMA,
+            },
+            "required": ["address", "size"],
+        },
+        "handler": tool_read_memory,
+    },
+    {
+        "name": "dolphin_write_memory",
+        "description": "Write raw bytes (hex string) to emulated memory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "integer"},
+                "data": {"type": "string", "description": "Hex string of bytes, e.g. 'deadbeef'."},
+                "addressSpace": _ADDRESS_SPACE_SCHEMA,
+            },
+            "required": ["address", "data"],
+        },
+        "handler": tool_write_memory,
+    },
+    {
+        "name": "dolphin_read_u32",
+        "description": "Read a big-endian 32-bit value from emulated memory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"address": {"type": "integer"}},
+            "required": ["address"],
+        },
+        "handler": tool_read_u32,
+    },
+    {
+        "name": "dolphin_write_u32",
+        "description": "Write a big-endian 32-bit value to emulated memory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "integer"},
+                "value": {"type": "integer"},
+            },
+            "required": ["address", "value"],
+        },
+        "handler": tool_write_u32,
+    },
+    {
+        "name": "dolphin_cheat_search_begin",
+        "description": "Start a cheat (memory) search session over a value type and memory range.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dataType": {"type": "string",
+                             "enum": ["u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64", "f32", "f64"],
+                             "description": "Value type to search (default u32)."},
+                "addressSpace": _ADDRESS_SPACE_SCHEMA,
+                "aligned": {"type": "boolean"},
+                "ranges": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "start": {"type": "integer"},
+                            "length": {"type": "integer"},
+                        },
+                    },
+                    "description": "Memory ranges to scan (defaults to MEM1/MEM2).",
+                },
+            },
+        },
+        "handler": tool_cheat_search_begin,
+    },
+    {
+        "name": "dolphin_cheat_search_next",
+        "description": "Run a search step within a session (new search or refine previous results).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sessionId": {"type": "integer"},
+                "compareType": {"type": "string",
+                                "enum": ["eq", "ne", "lt", "le", "gt", "ge"]},
+                "filterType": {"type": "string", "enum": ["value", "last", "none"]},
+                "value": {"type": "string", "description": "Value to compare against (filterType=value)."},
+                "hex": {"type": "boolean", "description": "Parse 'value' as hex."},
+            },
+            "required": ["sessionId"],
+        },
+        "handler": tool_cheat_search_next,
+    },
+    {
+        "name": "dolphin_cheat_search_results",
+        "description": "List current results of a cheat search session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sessionId": {"type": "integer"},
+                "offset": {"type": "integer"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["sessionId"],
+        },
+        "handler": tool_cheat_search_results,
+    },
+    {
+        "name": "dolphin_cheat_search_generate_ar",
+        "description": "Generate an Action Replay code for a result in a cheat search session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sessionId": {"type": "integer"},
+                "index": {"type": "integer"},
+            },
+            "required": ["sessionId", "index"],
+        },
+        "handler": tool_cheat_search_generate_ar,
+    },
+    {
+        "name": "dolphin_cheat_search_end",
+        "description": "Close a cheat search session and free its results.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"sessionId": {"type": "integer"}},
+            "required": ["sessionId"],
+        },
+        "handler": tool_cheat_search_end,
+    },
+    {
+        "name": "dolphin_apply_ar",
+        "description": "Apply an Action Replay code at runtime (list of {address,value} ops).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "ops": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "address": {"type": "integer"},
+                            "value": {"type": "integer"},
+                        },
+                        "required": ["address", "value"],
+                    },
+                },
+            },
+            "required": ["ops"],
+        },
+        "handler": tool_apply_ar,
+    },
+    {
+        "name": "dolphin_apply_gecko",
+        "description": "Apply a Gecko code at runtime (list of 'AAAAAAAA DDDDDDDD' lines). "
+                       "Replaces the active Gecko set.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "lines": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["lines"],
+        },
+        "handler": tool_apply_gecko,
+    },
+    {
+        "name": "dolphin_rpc",
+        "description": "Escape hatch: call any DebugRPC method directly with raw params.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "method": {"type": "string"},
+                "params": {"type": "object"},
+            },
+            "required": ["method"],
+        },
+        "handler": tool_raw_rpc,
+    },
+]
+
+TOOLS_BY_NAME = {tool["name"]: tool for tool in TOOLS}
+
+
+# --- MCP stdio server --------------------------------------------------------
+def _public_tool(tool):
+    return {k: v for k, v in tool.items() if k != "handler"}
+
+
+def handle_request(request):
+    method = request.get("method")
+    request_id = request.get("id")
+
+    if method == "initialize":
+        client_version = (request.get("params") or {}).get("protocolVersion")
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": client_version or PROTOCOL_VERSION,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            },
+        }
+
+    if method in ("notifications/initialized", "initialized"):
+        return None  # notification, no response
+
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": request_id, "result": {}}
+
+    if method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"tools": [_public_tool(t) for t in TOOLS]},
+        }
+
+    if method == "tools/call":
+        params = request.get("params") or {}
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+        tool = TOOLS_BY_NAME.get(name)
+        if tool is None:
+            return _tool_error(request_id, f"Unknown tool: {name}")
+        try:
+            result = tool["handler"](arguments)
+            text = json.dumps(result, indent=2)
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"content": [{"type": "text", "text": text}], "isError": False},
+            }
+        except Exception as exc:  # surface errors back to the model
+            return _tool_error(request_id, f"{type(exc).__name__}: {exc}")
+
+    # Unknown method.
+    if request_id is None:
+        return None
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": -32601, "message": f"Method not found: {method}"},
+    }
+
+
+def _tool_error(request_id, message):
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {"content": [{"type": "text", "text": message}], "isError": True},
+    }
+
+
+def main():
+    log(f"starting (default RPC {DEFAULT_HOST}:{DEFAULT_PORT})")
+    stdin = sys.stdin
+    while True:
+        line = stdin.readline()
+        if not line:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as exc:
+            log(f"failed to parse line: {exc}")
+            continue
+
+        response = handle_request(request)
+        if response is not None:
+            sys.stdout.write(json.dumps(response) + "\n")
+            sys.stdout.flush()
+
+    CLIENT.quit()
+    log("shutting down")
+
+
+if __name__ == "__main__":
+    main()

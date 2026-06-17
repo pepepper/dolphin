@@ -45,6 +45,7 @@
 #include "Core/ConfigManager.h"
 #include "Core/CoreTiming.h"
 #include "Core/DSPEmulator.h"
+#include "Core/DebugRPC/DebugRPCServer.h"
 #include "Core/DolphinAnalytics.h"
 #include "Core/FifoPlayer/FifoPlayer.h"
 #include "Core/FreeLookManager.h"
@@ -383,8 +384,19 @@ static void CpuThread(Core::System& system, const std::optional<std::string>& sa
     }
   }
 
+  {
+    const int debug_rpc_port = Config::Get(Config::MAIN_DEBUG_RPC_PORT);
+    if (debug_rpc_port > 0 && debug_rpc_port <= 0xffff &&
+        !AchievementManager::GetInstance().IsHardcoreModeActive())
+    {
+      DebugRPC::Init(system, static_cast<u16>(debug_rpc_port));
+    }
+  }
+
   // Enter CPU run loop. When we leave it - we are done.
   system.GetCPU().Run();
+
+  DebugRPC::Deinit();
 
 #ifdef USE_MEMORYWATCHER
   s_memory_watcher.reset();
