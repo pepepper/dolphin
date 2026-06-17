@@ -226,6 +226,7 @@
     <ClInclude Include="Core\Debugger\OSThread.h" />
     <ClInclude Include="Core\Debugger\PPCDebugInterface.h" />
     <ClInclude Include="Core\Debugger\RSO.h" />
+    <ClInclude Include="Core\DebugRPC\DebugRPCServer.h" />
     <ClInclude Include="Core\DolphinAnalytics.h" />
     <ClInclude Include="Core\DSP\DSPAccelerator.h" />
     <ClInclude Include="Core\DSP\DSPAnalyzer.h" />
@@ -935,6 +936,7 @@
     <ClCompile Include="Core\Debugger\OSThread.cpp" />
     <ClCompile Include="Core\Debugger\PPCDebugInterface.cpp" />
     <ClCompile Include="Core\Debugger\RSO.cpp" />
+    <ClCompile Include="Core\DebugRPC\DebugRPCServer.cpp" />
     <ClCompile Include="Core\DolphinAnalytics.cpp" />
     <ClCompile Include="Core\DSP\DSPAccelerator.cpp" />
     <ClCompile Include="Core\DSP\DSPAnalyzer.cpp" />

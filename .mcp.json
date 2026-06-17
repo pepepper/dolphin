@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "dolphin": {
+      "command": "python3",
+      "args": ["Tools/mcp/dolphin_mcp_server.py"],
+      "env": {
+        "DOLPHIN_RPC_PORT": "6090"
+      }
+    }
+  }
+}
