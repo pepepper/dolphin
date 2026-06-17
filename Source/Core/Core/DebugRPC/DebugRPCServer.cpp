@@ -28,6 +28,7 @@
 #include <fmt/format.h>
 #include <picojson.h>
 
+#include "Common/Align.h"
 #include "Common/Config/Config.h"
 #include "Common/Logging/Log.h"
 #include "Common/SocketContext.h"
@@ -683,14 +684,44 @@ private:
       return MakeError(id, -32602, "'data' is not a valid hex string");
 
     const PowerPC::RequestedAddressSpace space = ParseAddressSpace(params);
-    const Core::CPUThreadGuard guard(m_system);
+    const u32 start = static_cast<u32>(*address);
 
+    const Core::CPUThreadGuard guard(m_system);
+    auto& power_pc = m_system.GetPowerPC();
+
+    // HostWrite does not invalidate the JIT / CachedInterpreter block cache, so
+    // writing to a code region would otherwise keep executing stale compiled
+    // blocks. Mirror the debugger's patch path and schedule a cache invalidation
+    // for each modified 4-byte word (only words that actually change).
+    bool should_invalidate = false;
     for (size_t i = 0; i < bytes->size(); ++i)
     {
-      const u32 addr = static_cast<u32>(*address) + static_cast<u32>(i);
-      const auto result = PowerPC::MMU::HostTryWrite<u8>(guard, (*bytes)[i], addr, space);
-      if (!result)
-        return MakeError(id, 2, fmt::format("memory at {:#010x} not writable", addr));
+      const u32 addr = start + static_cast<u32>(i);
+      const u8 new_byte = (*bytes)[i];
+
+      const auto old_byte = PowerPC::MMU::HostTryRead<u8>(guard, addr, space);
+      if (!old_byte)
+        return MakeError(id, 2, fmt::format("memory at {:#010x} not accessible", addr));
+
+      if (old_byte->value != new_byte)
+      {
+        const auto result = PowerPC::MMU::HostTryWrite<u8>(guard, new_byte, addr, space);
+        if (!result)
+          return MakeError(id, 2, fmt::format("memory at {:#010x} not writable", addr));
+        should_invalidate = true;
+      }
+
+      if ((addr % 4) == 3)
+      {
+        if (should_invalidate)
+          power_pc.ScheduleInvalidateCacheThreadSafe(Common::AlignDown(addr, 4));
+        should_invalidate = false;
+      }
+    }
+    if (should_invalidate)
+    {
+      power_pc.ScheduleInvalidateCacheThreadSafe(
+          Common::AlignDown(start + static_cast<u32>(bytes->size()) - 1, 4));
     }
 
     picojson::object r;

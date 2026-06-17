@@ -121,6 +121,10 @@ Byte payloads are lowercase hex strings.
 | `memcheck.add` | `{address, end?, read?, write?, break?, log?}` | `{added}` |
 | `memcheck.remove` / `memcheck.list` | `{address}` / – | … |
 
+`memory.write` invalidates the JIT / CachedInterpreter block cache for any
+modified 4-byte word (like the built-in debugger), so writing to a code region
+takes effect immediately instead of running stale compiled blocks.
+
 `addressSpace` is one of `effective` (default), `physical`, or `virtual`.
 `dataType` is one of `u8 u16 u32 u64 s8 s16 s32 s64 f32 f64`.
 `compareType` is `eq ne lt le gt ge`; `filterType` is `value last none`.
